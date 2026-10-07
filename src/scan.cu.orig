@@ -1,0 +1,753 @@
+/* -------------------------------------------------------------------
+ * CUDA miRanda- An miRNA target scanner with CUDA speedup
+  *
+ * Copyright (C) (2012) UCSD DBMI Shuang Wang
+ *
+ * Distributed under the GNU Public License (GPL)
+ * See the files 'COPYING' and 'LICENSE' for details
+ *
+ * Authors: Shuang Wang, */
+
+#include "config.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <assert.h>
+#include <ctype.h>
+// include Intellisense
+#include "cuda.h"
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+// includes, project
+#include <cutil_inline.h>
+#include <shrQATest.h>
+
+extern "C"{
+#include "mirandaVar.h"
+#include "miranda.h"
+}
+#include "mirandaCPP.h"
+// include Intellisense
+#include "cuda.h"
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+
+// includes, project
+#include <cutil_inline.h>
+#include <shrQATest.h>
+
+// includes, kernels
+#include "template_kernel.cu"
+
+//int *shift_offset_level1;
+//int *shift_offset_level2;
+//int *shift_offset_level3;
+
+int *shift_offset_level1_score;
+int *shift_offset_level2_score;
+
+int *shift_offset_level1_hit_alignment;
+int *shift_offset_level2_hit_alignment;
+int *shift_offset_level3_hit_alignment;
+
+int * createShift_offset_level(int size, int offset){
+	int * out = (int *) calloc(size+1, sizeof(int));
+	for(int i = 0; i < size + 1; i ++){
+		out[i] = i*offset;
+	}
+	return out;
+}
+
+int cmpHits(const void* p1, const void* p2) {
+	int3* s1 = (int3*)p1;
+	int3* s2 = (int3*)p2;
+	/* primary key: score */
+	if (s1->y < s2->y) return 1;
+	if (s1->y > s2->y) return -1;
+	/* secondary key: earlier end in reference */
+	if (s1->z > s2->z) return 1;
+	if (s1->z < s2->z) return -1;
+	return 0;
+}
+
+void calc_scores_energy(int * good_count, int * restricted_Array, input_type * query_array, int reference_sequence_length, 
+	                    char *reference_sequence, 
+						char* reference_sequence_name,
+						FILE * fpout, FloatType* end_score, HitSummary* hit_summary, S_HIT_struct *s_hit_struct, char4 * s_hit_struct_alignment, int * utr_processed){
+	for(int q = 0; q < query_array->size; q++){		
+		(*utr_processed)++;
+			if (restricted_Array[q] || good_count[q] <= 0) continue;	
+			int good_ones_count = -1;
+			int *good_ones_starts_j = (int*)calloc(reference_sequence_length, sizeof(int));
+			int *good_ones_ends_j = (int*)calloc(reference_sequence_length, sizeof(int));			
+			/*Struct to store hit information*/
+			hit_struct* hit = newHit_struct(query_array->seqlen[q], reference_sequence_length);		
+			// sort the score so that the output can match the original miranda
+			int3* sortedHits = new int3[good_count[q]];			
+			for(int i = 0; i < good_count[q]; i++){
+				sortedHits[i].x = i;  // original id
+				sortedHits[i].y = s_hit_struct[q + shift_offset_level2_score[i]].score; // sorces;
+				sortedHits[i].z = s_hit_struct[q + shift_offset_level2_score[i]].ref_end; // sorces;
+			}
+
+			qsort(sortedHits, good_count[q], sizeof(int3), cmpHits);
+			
+			for(int ii = 0; ii < good_count[q]; ii++){	
+				int i = sortedHits[ii].x;
+			//for(int i = 0; i < 0; i++){	
+				//S_HIT_struct tmp_s_hit_struct = s_hit_struct[q + shift_offset_level2_score[i]];			
+				S_HIT_struct tmp_s_hit_struct = s_hit_struct[q + shift_offset_level2_score[i]];			
+				FloatType hit_score = (FloatType) tmp_s_hit_struct.score;				
+				if (hit_score < score_threshold) {
+					//printf("there is an error in hit_Struct\n...");
+					//exit(0);
+					continue;
+				}
+				int utr_offset3p = 0;
+				int utr_offset5p = 0;
+				int good_call = 1;
+				clear_hit(hit, query_array->seqlen[q], reference_sequence_length);				
+				if (debug) {					
+					fprintf(fpout, "[%d] score i j path ->> %d %d %d %d\n", i, tmp_s_hit_struct.score,
+						tmp_s_hit_struct.query_end, tmp_s_hit_struct.ref_end, tmp_s_hit_struct.path);
+					fflush(fpout);
+				}	
+
+				// trace back has been done at the outside loop, here we only need to copy back the results.
+				int tmp_shift_id_hit_aligment = shift_offset_level2_hit_alignment[i] + shift_offset_level3_hit_alignment[q];
+				traceback_cpy(hit, tmp_s_hit_struct, s_hit_struct_alignment + tmp_shift_id_hit_aligment);					
+				good_call = testfor_overlap(good_ones_starts_j, good_ones_ends_j, &good_ones_count,
+					hit->ref_start, hit->ref_end);
+				if (good_call == 1) {
+					good_ones_starts_j[good_ones_count] = hit->ref_start;
+					good_ones_ends_j[good_ones_count] = hit->ref_end;
+				}
+				//miRNA alignment, convert un-aligned nt to lowercase, aligned nt to uppercase
+				// hit->rest[0, 1, 2] = The 5' unaligned regions in the query, alignment and ref
+				// hit->rest[3, 4, 5] = The 3' unaligned regions in the query, alignment and ref
+				if (hit->query_start >= 1) {
+					for (int j = 0; j <= hit->query_start - 1; j++) {
+						int diff = hit->query_start - j;
+						hit->rest[0][j] = tolower(query_array->sequence[q][j]);
+						int tmp_integer = hit->ref_start - diff;
+						if (tmp_integer >= 0) {
+							hit->rest[1][j] = tolower(reference_sequence[tmp_integer]);
+							utr_offset3p++;
+						} else {
+							hit->rest[1][j] = '-';
+						}
+						hit->rest[2][j] = ' ';
+					}
+				}
+				if (hit->query_end < query_array->seqlen[q]) {
+					for (int j = hit->query_end; j < query_array->seqlen[q]; j++) {
+						int diff = j - hit->query_end;
+						hit->rest[3][j - hit->query_end] = tolower(query_array->sequence[q][j]);
+						int tmp_integer = hit->ref_end + diff;
+						if (tmp_integer < reference_sequence_length) {
+							hit->rest[4][j - hit->query_end] = tolower(reference_sequence[tmp_integer]);
+							utr_offset5p++;
+						} else {
+							hit->rest[4][j - hit->query_end] = '-';
+						}
+						hit->rest[5][j - hit->query_end] = ' ';
+					}
+				}
+				string_toupper(hit->alignment[0]);
+				string_toupper(hit->alignment[2]);
+				// Adjusting for offset due to local alignment in next two lines
+				hit->ref_end += (utr_offset5p - 1);
+				hit->ref_start -= utr_offset3p;
+				int mypos = 0;
+				int non_gap_count = 0;
+				int perfect_match_count = 0;
+				int gap_count = 0;
+				// looks for strict seed matches
+				if (strict) {
+					char strict_query_construct[200];
+					char strict_alignment_construct[200];
+					sprintf(strict_query_construct, "%s%s%s", hit->rest[3], hit->alignment[0], hit->rest[0]);
+					sprintf(strict_alignment_construct, "%s%s%s", hit->rest[5], hit->alignment[1], hit->rest[2]);				
+					//traverse the alignment
+					for (int j = 0; j < strlen(strict_query_construct); j++) {
+						if (strict_query_construct[j] != '-') {
+							//if no gaps in the miRNA alignment
+							mypos++;
+						}
+						if ((mypos >= 2) && (mypos <= 8)) {
+							if (strict_alignment_construct[j] != ' ') {
+								//if no gaps in the alignment i.e. if `|` or `:`
+								non_gap_count++;
+							}
+							if (strict_alignment_construct[j] == '|') {
+								perfect_match_count++;
+							}
+							if (strict_query_construct[j] == '-') {
+								gap_count++;
+							}
+						}
+						if (mypos == 8) break;
+						//printf("On Pos: %d [%d]-->%c %c\t[%d:%d]\n", mypos, j, strict_query_construct[j], strict_alignment_construct[j], count1, count2);
+					}
+					//fail if less than 7 perfect matches or any gaps
+					if (non_gap_count < 7 || perfect_match_count < 7 || gap_count > 0) {
+						good_call = 0;
+					}
+				}
+				//printf("Model Analysis: %d %d %d %d\n", count1, count2, count3, count4);
+				FloatType energy = 0;	
+				if (!no_energy) {
+					energy = get_energy(hit); /// nonononon energy
+				} else {
+					energy = -1000000;  
+				}  
+				if (energy < energy_threshold) {
+					// good_call, a good alignment that passes score, energy, etc. requirements
+					if (good_call) {
+						end_score[q] += (energy * -1);
+						hit_summary[q].no_hits++;
+						append_char_ExpString(hit_summary[q].position_list,' ');
+						append_int_ExpString(hit_summary[q].position_list,hit->ref_start + 1);
+						if (energy < hit_summary[q].max_hit) {
+							hit_summary[q].max_hit = energy;
+						}
+						hit_summary[q].total_score += hit->score;
+						if (hit->score > hit_summary[q].max_score) {
+							hit_summary[q].max_score = hit->score;
+						}
+						printhit(query_array->name[q], query_array->seqlen[q], reference_sequence_name, hit, energy, key_value_pairs, fpout);
+					}
+				}				
+			}//*/			 
+			free(good_ones_ends_j);
+			free(good_ones_starts_j); 			
+			freeHit_struct(hit);
+
+			// report the final results
+			if (end_score[q] > 0.0) {
+				fprintf(fpout, "Seq1,Seq2,Tot Score,Tot Energy,Max Score,Max Energy,Strand,Len1,Len2,Positions\n");
+				if (!no_energy) {
+					fprintf(fpout, ">>%s\t%s\t%2.2f\t-%2.2f\t%2.2f\t%2.2f\t%d\t%d\t%d\t%s\n",
+						query_array->name[q], reference_sequence_name, hit_summary[q].total_score,
+						end_score[q], hit_summary[q].max_score, hit_summary[q].max_hit,
+						*utr_processed, query_array->seqlen[q], reference_sequence_length,
+						access_ExpString(hit_summary[q].position_list));
+				} else {
+					fprintf(fpout, ">>%s\t%s\t%2.2f\t0.0\t%2.2f\t0.0\t%d\t%d\t%d\t%s\n",
+						query_array->name[q], reference_sequence_name, hit_summary[q].total_score,
+						hit_summary[q].max_score, *utr_processed, query_array->seqlen[q], reference_sequence_length,
+						access_ExpString(hit_summary[q].position_list));
+				}
+				fflush(fpout);
+			} 
+			if (end_score[q] > 0.0) {
+				fprintf(fpout, "Complete\n\n");
+				fflush(fpout);
+			}
+
+	}
+}
+
+void d_build_matrix_batch(cudaStream_t &s, int ref_overall_seqlen_max_patched, Reference_batch * reference_array, input_type * query_array, 	                    
+      	                unsigned short* d_track, ushort4* d_scores, int *d_good_count, TempData * d_tempData){   
+	int gridsize_X = (query_array->size_patched - 1)/WARP_SIZE + 1;  
+    dim3  grid(gridsize_X, 1, reference_array->size);
+	dim3  threads(WARP_SIZE, MAX_QUERY_LENGTH_AFTER_SPLIT, 1); 	    	
+	d_build_matrix<<<grid, threads, 0, s>>>((ref_overall_seqlen_max_patched + MAX_QUERY_LENGHT + 1) * MAX_QUERY_LENGHT/4 * query_array->size_patched,
+									   MAX_QUERY_LENGHT/4*query_array->size_patched,	                                
+									   query_array->size_patched, 
+									   MAX_REPORTS_OF_FIRST_HIT* query_array->size_patched,		                                
+									   score_threshold, 
+									   query_array->size,
+									   d_track, d_scores, d_good_count);
+									   //, d_tempData, (ref_overall_seqlen_max_patched + query_array->size_patched) * query_array->size_patched);	//*/
+	cutilCheckMsg("Kernel execution failed");	// check if kernel execution generated and error
+}
+
+void d_updateScores_batch(cudaStream_t &s, int ref_overall_seqlen_max_patched, Reference_batch * reference_array, input_type * query_array, 	                    
+      	                ushort4* d_scores, int *d_good_count){	
+	int gridsize_X = (query_array->size_patched - 1)/WARP_SIZE + 1;  
+    dim3  grid(gridsize_X, 1, reference_array->size);
+	dim3  threads(WARP_SIZE, 1, 1); 	    
+	//testKernel<<< grid, threads>>>(d_best); cutilCheckMsg("Kernel execution failed");	// check if kernel execution generated and error		
+	d_updateScores<<<grid, threads, 0, s>>>(MAX_REPORTS_OF_FIRST_HIT* query_array->size_patched, query_array->size_patched, d_scores, d_good_count);	//*/
+	cutilCheckMsg("Kernel execution failed");	// check if kernel execution generated and error
+}
+
+
+void calc_scores_energy_batch(int* good_count, Reference_batch * reference_array, input_type * query_array, 
+	                          S_HIT_struct *s_hit_struct, char4 * s_hit_struct_alignment, FILE* fpout, int * utr_processed){
+	for(int j = 0; j < reference_array->size; j++){ // for all ref in each batch			
+		calc_scores_energy(good_count + j*query_array->size_patched, reference_array->restricted_Array[j], query_array, reference_array->seqlen[j], reference_array->sequence[j], reference_array->name[j], fpout, reference_array->end_score[j], reference_array->hit_summary[j], s_hit_struct + shift_offset_level1_score[j], s_hit_struct_alignment + shift_offset_level1_hit_alignment[j], utr_processed);
+	}
+} 
+ 
+void d_traceback_batch(cudaStream_t &s, int ref_batch_overall_seqlen_max_patched, Reference_batch * reference_array, input_type * query_array, 
+	                 int * d_good_count, unsigned short* d_track, ushort4* d_scores,
+					 S_HIT_struct *d_s_hit_struct, char4 * d_s_hit_struct_alignment){
+	int gridsize_X = (query_array->size_patched - 1)/WARP_SIZE + 1;  
+    dim3  grid(gridsize_X, 1, reference_array->size);
+	dim3  threads(WARP_SIZE, 1, 1); 	     	
+	d_traceback<<<grid, threads, 0, s>>>((int)score_threshold, 
+		                            (ref_batch_overall_seqlen_max_patched + MAX_QUERY_LENGHT + 1) * MAX_QUERY_LENGHT/4 * query_array->size_patched,		                           
+									MAX_REPORTS_OF_FIRST_HIT* query_array->size_patched*(MAX_QUERY_LENGHT + MAX_QUERY_APPENDIX), 
+									query_array->size_patched*(MAX_QUERY_LENGHT + MAX_QUERY_APPENDIX),
+								    query_array->size_patched*MAX_QUERY_LENGHT/4,
+	                                MAX_REPORTS_OF_FIRST_HIT* query_array->size_patched, 
+								    query_array->size_patched, 
+								    d_good_count, d_track, d_scores, d_s_hit_struct, d_s_hit_struct_alignment);	//*/
+	cutilCheckMsg("Kernel execution failed");	// check if kernel execution generated and error
+}
+    
+void initializeOpenExtSeedArray(input_type * query_array, char2* open_ext, unsigned int *in_seed){
+	if(abs(scale * gap_open) > 127 || abs(scale * gap_extend) > 127 || abs(gap_open) > 127 || abs(gap_extend) >127){
+		printf("ERROR: scale or gap_open or gap_Extend are too large\n try to use short3 for open_ext\n");
+		exit(0);
+	}
+	if(query_array->size_patched > MAX_NUM_QUERY_FOR_CONSTANT_MEMORY){
+		printf("total number of query is larger than %d, which will be supported in the next release\n", MAX_NUM_QUERY_FOR_CONSTANT_MEMORY);
+		exit(0);
+	}
+
+	for(int q = 0; q < query_array->size; q++){					
+		for (int i = 31; i >=1 ; i--) {
+			if(i <= query_array->seqlen[q]){
+				int shift_id = i * query_array->size_patched;
+				if (i > length_3p_for_weighting_array[q] && i < query_array->seqlen[q]) {
+					open_ext[q + shift_id].x = (char)(scale * gap_open);
+					open_ext[q + shift_id].y = (char)(scale * gap_extend);
+					in_seed[q] = (in_seed[q]<<1) + 1;
+				} else {			
+					open_ext[q + shift_id].x = (char)gap_open;
+					open_ext[q + shift_id].y = (char)gap_extend;
+					in_seed[q] <<= 1;
+				}
+			}
+		}
+		in_seed[q] <<= 1; // for i = 0;
+	}
+
+}
+
+void print_func_attr(struct cudaFuncAttributes at, char * name)
+{
+		printf("function: %s\n", name);
+        printf("    Constant memory in bytes: %lu\n", at.constSizeBytes);
+        printf("    Local memory in bytes: %lu\n", at.localSizeBytes);
+        printf("    Max Thread per Block: %d\n", at.maxThreadsPerBlock);
+        printf("    Number of registers used: %d\n", at.numRegs);
+        printf("    Shared memory in bytes: %lu\n", at.sharedSizeBytes);       
+		printf("================================\n");
+}
+
+void getMax_good_count(int* shif_offset_level1_good_count, int* shif_offset_level2_good_count, int *max_good_count, double * mean_good_count, int *good_count, int ref_batch_length, int ref_batch_size_query_array_size_patched, int total_num_pairs){
+	int tmp_count = 0;
+	for(int i = 0; i < ref_batch_length; i++){  // for all batch	
+		for(int g = 0; g < nGPUs; g++){
+			for(int kk = 0; kk < ref_batch_size_query_array_size_patched; kk++){				 
+				int tmp_good_count = good_count[shif_offset_level1_good_count[i] + shif_offset_level2_good_count[g] + kk];
+				tmp_count += tmp_good_count;
+				if(tmp_good_count > *max_good_count){
+					*max_good_count = tmp_good_count; 					
+				}  
+			}
+		}
+	}
+	*mean_good_count = ((double)tmp_count)/total_num_pairs;
+}
+
+#define __profile_memory__
+#ifdef __profile_memory__
+size_t getMemUse(size_t prevMem, char* disc)
+{
+	size_t avail;
+	size_t total;
+	cudaMemGetInfo( &avail, &total );
+	size_t use = total - avail;
+	if(disc != NULL){
+		printf("%s use %4.6f MB (total: %f)\n", disc, (use - prevMem)/1048576.0, use/1048576.0);
+	}
+	return use;
+}
+#endif
+void do_alignment(input_type * query_array, Ref_batch* ref_batch, int verbose,
+	FILE* fpout, int * length_3p_for_weighting_array, float * io_write_timer_double, int *max_good_count, double * mean_good_count, double * GCUP)
+{	
+	size_t memUse;
+	unsigned int io_write_timer = 0;	
+	clock_t t_tmp = clock();
+	int utr_processed = 0;	
+	int* good_count = new1dInt(ref_batch->batch_length * nGPUs * ref_batch_size * query_array->size_patched);
+	int* shif_offset_level1_good_count = createShift_offset_level(ref_batch->batch_length, nGPUs * ref_batch_size * query_array->size_patched);
+	int* shif_offset_level2_good_count = createShift_offset_level(nGPUs, ref_batch_size * query_array->size_patched);
+	*max_good_count = 0; 
+	char2 *open_ext = (char2 *)calloc(MAX_NUM_QUERY_FOR_CONSTANT_MEMORY*MAX_QUERY_LENGHT, sizeof(char2));
+	unsigned int * in_seed = (unsigned int *)calloc(MAX_NUM_QUERY_FOR_CONSTANT_MEMORY, sizeof(unsigned int));
+	memset(in_seed, 0,MAX_NUM_QUERY_FOR_CONSTANT_MEMORY * sizeof(unsigned int));
+	initializeOpenExtSeedArray(query_array, open_ext, in_seed);
+	 
+	MultiCPUPlan* plan_CPU = (MultiCPUPlan*) malloc(sizeof(MultiGPUPlan) *nGPUs);
+	for(int g = 0; g < nGPUs; g++){
+		plan_CPU[g].s_hit_struct = (S_HIT_struct *)calloc(ref_batch_size * MAX_REPORTS_OF_FIRST_HIT * query_array->size_patched, sizeof(S_HIT_struct));
+		plan_CPU[g].s_hit_struct_alignment = (char4 *)calloc(ref_batch_size * MAX_REPORTS_OF_FIRST_HIT * query_array->size_patched * (MAX_QUERY_LENGHT+MAX_QUERY_APPENDIX), sizeof(char4));
+	}
+
+	shift_offset_level1_score = createShift_offset_level(ref_batch_size, MAX_REPORTS_OF_FIRST_HIT* query_array->size_patched);
+	shift_offset_level2_score = createShift_offset_level(MAX_REPORTS_OF_FIRST_HIT, query_array->size_patched);
+
+	shift_offset_level1_hit_alignment = createShift_offset_level(ref_batch_size, MAX_REPORTS_OF_FIRST_HIT* query_array->size_patched*(MAX_QUERY_LENGHT+MAX_QUERY_APPENDIX));
+	shift_offset_level2_hit_alignment = createShift_offset_level(MAX_REPORTS_OF_FIRST_HIT, query_array->size_patched*(MAX_QUERY_LENGHT+MAX_QUERY_APPENDIX));
+	shift_offset_level3_hit_alignment = createShift_offset_level(query_array->size_patched, (MAX_QUERY_LENGHT+MAX_QUERY_APPENDIX));
+
+	/*shift_offset_level1 = createShift_offset_level(ref_batch_size, (ref_batch->overall_seqlen_max_patched + MAX_QUERY_LENGHT + 1) * MAX_QUERY_LENGHT * query_array->size_patched);
+	shift_offset_level2 = createShift_offset_level((ref_batch->overall_seqlen_max_patched + MAX_QUERY_LENGHT + 1), MAX_QUERY_LENGHT * query_array->size_patched);
+	shift_offset_level3 = createShift_offset_level(MAX_QUERY_LENGHT, query_array->size_patched);*/	
+	//int shift_offset_ref   =  MAX_QUERY_LENGHT*query_array->size_patched;
+
+	// initialize multiple GPUS	
+
+	MultiGPUPlan* plan = (MultiGPUPlan*) malloc(sizeof(MultiGPUPlan) *nGPUs);
+	   
+	//create memory to be binded with texture memory
+	cudaChannelFormatDesc char_channelDesc = cudaCreateChannelDesc<char>();	 
+	cudaChannelFormatDesc char2_channelDesc = cudaCreateChannelDesc<char2>();	 
+	cudaChannelFormatDesc char4_channelDesc = cudaCreateChannelDesc<char4>();
+
+	// allocate memory
+	for(int g = 0; g < nGPUs; g++){
+		cutilSafeCall( cudaSetDevice(g) ); 	
+		cutilSafeCall( cudaStreamCreate(&plan[g].stream) );
+#ifdef __profile_memory__
+		if(g == 0) {memUse = getMemUse(0, NULL);}
+#endif
+		cutilSafeCall( cudaMalloc( (void**) &plan[g].d_s_hit_struct, ref_batch_size * MAX_REPORTS_OF_FIRST_HIT * query_array->size_patched * sizeof(S_HIT_struct)));
+#ifdef __profile_memory__
+		if(g == 0) {memUse = getMemUse(memUse, "d_s_hit_struct");}
+#endif		
+		cutilSafeCall( cudaMalloc( (void**) &plan[g].d_s_hit_struct_alignment, ref_batch_size * MAX_REPORTS_OF_FIRST_HIT * query_array->size_patched * (MAX_QUERY_LENGHT +MAX_QUERY_APPENDIX)* sizeof(char4)));	
+#ifdef __profile_memory__
+		if(g == 0) {memUse = getMemUse(memUse, "d_s_hit_struct_alignment");}
+#endif
+		cutilSafeCall( cudaMalloc( (void**) &plan[g].d_track, ref_batch_size * (ref_batch->overall_seqlen_max_patched + MAX_QUERY_LENGHT + 1) * MAX_QUERY_LENGTH_AFTER_SPLIT * query_array->size_patched * sizeof(unsigned short)));			
+#ifdef __profile_memory__
+		if(g == 0) {memUse = getMemUse(memUse, "d_track");}
+#endif
+		cutilSafeCall( cudaMalloc( (void**) &plan[g].d_scores, ref_batch_size * MAX_REPORTS_OF_FIRST_HIT * query_array->size_patched * sizeof(ushort4)));	
+#ifdef __profile_memory__
+		if(g == 0) {memUse = getMemUse(memUse, "d_scores");}
+#endif
+		cutilSafeCall( cudaMalloc( (void**) &plan[g].d_good_count, ref_batch_size * query_array->size_patched * sizeof(int) ));		
+#ifdef __profile_memory__
+		if(g == 0) {memUse = getMemUse(memUse, "d_good_count");}
+#endif
+		// for query char 4
+		cutilSafeCall( cudaMallocArray(&plan[g].d_query_sequence, &char4_channelDesc, query_array->size_patched, MAX_QUERY_LENGHT/4 ));	
+#ifdef __profile_memory__
+		if(g == 0) {memUse = getMemUse(memUse, "d_query_sequence");}
+#endif
+		// for query raw char2
+		cutilSafeCall( cudaMallocArray(&plan[g].d_query_sequence_raw, &char2_channelDesc, query_array->size_patched, MAX_QUERY_LENGHT));
+#ifdef __profile_memory__
+		if(g == 0) {memUse = getMemUse(memUse, "d_query_sequence_raw");}
+#endif
+		// tex and constant memory are per dev resources;
+		d_tex_query_sequence.addressMode[0] = cudaAddressModeClamp;
+		d_tex_query_sequence.addressMode[1] = cudaAddressModeClamp;
+		d_tex_query_sequence.filterMode = cudaFilterModePoint;
+		d_tex_query_sequence.normalized = false;  
+
+		d_tex_query_sequence_raw.addressMode[0] = cudaAddressModeClamp;
+		d_tex_query_sequence_raw.addressMode[1] = cudaAddressModeClamp;
+		d_tex_query_sequence_raw.filterMode = cudaFilterModePoint;
+		d_tex_query_sequence_raw.normalized = false;  
+	}	
+	// set page lock
+	cudaHostRegister(query_array->sequence1D_reshape, sizeof(char4) * query_array->size_patched * MAX_QUERY_LENGHT/4, cudaHostRegisterPortable);
+	cudaHostRegister(query_array->sequence1D_reshape_raw, sizeof(char2) * query_array->size_patched * MAX_QUERY_LENGHT, cudaHostRegisterPortable);
+	cudaHostRegister(ali_score, 32*sizeof(int), cudaHostRegisterPortable);
+	cudaHostRegister(ali_rep, 32*sizeof(char), cudaHostRegisterPortable);
+	cudaHostRegister(ali_score5p, 32*sizeof(int), cudaHostRegisterPortable);
+	cudaHostRegister(length_3p_for_weighting_array, sizeof(int) * MAX_NUM_QUERY_FOR_CONSTANT_MEMORY, cudaHostRegisterPortable);
+	cudaHostRegister(open_ext, sizeof(char2)*MAX_NUM_QUERY_FOR_CONSTANT_MEMORY*MAX_QUERY_LENGHT, cudaHostRegisterPortable);
+	cudaHostRegister(in_seed, sizeof(unsigned int)*MAX_NUM_QUERY_FOR_CONSTANT_MEMORY, cudaHostRegisterPortable);
+	cudaHostRegister(query_array->seqlen, sizeof(int) * MAX_NUM_QUERY_FOR_CONSTANT_MEMORY, cudaHostRegisterPortable);
+
+
+	// concurrent copy
+	for(int g = 0; g < nGPUs; g++){
+		cutilSafeCall( cudaSetDevice(g) ); 			
+		cutilSafeCall( cudaMemcpyToArrayAsync(plan[g].d_query_sequence, 0, 0, query_array->sequence1D_reshape, sizeof(char4) * query_array->size_patched * MAX_QUERY_LENGHT/4, cudaMemcpyHostToDevice, plan[g].stream) );				
+		// for query raw char2		
+		cutilSafeCall( cudaMemcpyToArrayAsync(plan[g].d_query_sequence_raw, 0, 0, query_array->sequence1D_reshape_raw, sizeof(char2) * query_array->size_patched * MAX_QUERY_LENGHT, cudaMemcpyHostToDevice, plan[g].stream) );	
+		// bind constant memory
+		cutilSafeCall( cudaMemcpyToSymbolAsync("d_c_ali_score", ali_score, 32*sizeof(int), 0, cudaMemcpyHostToDevice, plan[g].stream));
+		cutilSafeCall( cudaMemcpyToSymbolAsync("d_c_ali_rep", ali_rep, 32*sizeof(char), 0, cudaMemcpyHostToDevice, plan[g].stream));	
+		cutilSafeCall( cudaMemcpyToSymbolAsync("d_c_ali_score5p", ali_score5p, 32*sizeof(int), 0, cudaMemcpyHostToDevice, plan[g].stream));
+		cutilSafeCall( cudaMemcpyToSymbolAsync("d_c_length_3p_for_weighting_array", length_3p_for_weighting_array, sizeof(int) * MAX_NUM_QUERY_FOR_CONSTANT_MEMORY, 0, cudaMemcpyHostToDevice, plan[g].stream));
+		cutilSafeCall( cudaMemcpyToSymbolAsync("d_c_open_ext",open_ext,sizeof(char2)*MAX_NUM_QUERY_FOR_CONSTANT_MEMORY*MAX_QUERY_LENGHT, 0, cudaMemcpyHostToDevice, plan[g].stream));	
+		cutilSafeCall( cudaMemcpyToSymbolAsync("d_c_in_seed",in_seed,sizeof(unsigned int)*MAX_NUM_QUERY_FOR_CONSTANT_MEMORY, 0, cudaMemcpyHostToDevice, plan[g].stream));	
+		cutilSafeCall( cudaMemcpyToSymbolAsync("d_c_query_seqlen", query_array->seqlen, sizeof(int) * MAX_NUM_QUERY_FOR_CONSTANT_MEMORY, 0, cudaMemcpyHostToDevice, plan[g].stream));	//*/
+	}		
+	cutilSafeCall(cudaDeviceSynchronize());
+	// bind with texture memory
+	for(int g = 0; g < nGPUs; g++){
+		cutilSafeCall( cudaSetDevice(g) ); 					               
+		cutilSafeCall( cudaBindTextureToArray(d_tex_query_sequence, plan[g].d_query_sequence, char4_channelDesc));				
+		cutilSafeCall( cudaBindTextureToArray(d_tex_query_sequence_raw, plan[g].d_query_sequence_raw, char2_channelDesc));	
+	}
+	//*t_cudaMemory += clock() - t_tmp;	
+	double factor_length = 1;
+	for(int i = 0; i < ref_batch->batch_length*factor_length; i++){  // for all batch	
+		//printf("%d/%d\n",i, (int)(ref_batch->batch_length*factor_length));
+		// allocate memory
+		for(int g = 0; g < nGPUs; g++){	
+			if(ref_batch->reference_batch[i][g].size == 0) break;
+			// register memory			
+			cudaHostRegister(ref_batch->reference_batch[i][g].seqlen, sizeof(int) * MAX_RefBatchSize, cudaHostRegisterPortable);
+			cudaHostRegister(ref_batch->reference_batch[i][g].sequence1D_revalued, sizeof(char4) * ref_batch->reference_batch[i][g].size * ref_batch->reference_batch[i][g].seqlen_max_patched_char4, cudaHostRegisterPortable);
+			cudaHostRegister(ref_batch->reference_batch[i][g].sequence1D_revalued_raw, sizeof(char2) * ref_batch->reference_batch[i][g].size * ref_batch->reference_batch[i][g].seqlen_max_patched, cudaHostRegisterPortable);
+			cutilSafeCall( cudaSetDevice(g) ); 			
+			cutilSafeCall( cudaMallocArray(&plan[g].d_reference_batch_sequence, &char4_channelDesc, ref_batch->reference_batch[i][g].seqlen_max_patched_char4, ref_batch->reference_batch[i][g].size));				
+			cutilSafeCall( cudaMallocArray(&plan[g].d_reference_batch_sequence_raw, &char2_channelDesc, ref_batch->reference_batch[i][g].seqlen_max_patched, ref_batch->reference_batch[i][g].size));	
+			d_tex_reference_batch_sequence.addressMode[0] = cudaAddressModeClamp;
+			d_tex_reference_batch_sequence.addressMode[1] = cudaAddressModeClamp;
+			d_tex_reference_batch_sequence.filterMode = cudaFilterModePoint;
+			d_tex_reference_batch_sequence.normalized = false; 
+			d_tex_reference_batch_sequence_raw.addressMode[0] = cudaAddressModeClamp;
+			d_tex_reference_batch_sequence_raw.addressMode[1] = cudaAddressModeClamp;
+			d_tex_reference_batch_sequence_raw.filterMode = cudaFilterModePoint;
+			d_tex_reference_batch_sequence_raw.normalized = false; 
+			cutilSafeCall( cudaMemset(plan[g].d_scores, 0, ref_batch_size * MAX_REPORTS_OF_FIRST_HIT* query_array->size_patched * sizeof(ushort4))); 		
+			cutilSafeCall( cudaMemset(plan[g].d_s_hit_struct, 0, ref_batch_size * MAX_REPORTS_OF_FIRST_HIT* query_array->size_patched * sizeof(S_HIT_struct))); 		
+			cutilSafeCall( cudaMemset(plan[g].d_s_hit_struct_alignment, 0, ref_batch_size * MAX_REPORTS_OF_FIRST_HIT* query_array->size_patched * (MAX_QUERY_LENGHT+MAX_QUERY_APPENDIX)* sizeof(char4))); // make it is a multiple of 32 we use char 4 to save space, so that max_query_appenxi = 8; 					
+		}		
+		// concurrent memcpy
+		for(int g = 0; g < nGPUs; g++){
+			if(ref_batch->reference_batch[i][g].size == 0) break;				
+			cutilSafeCall( cudaSetDevice(g) ); 
+			// bind constant memory.
+			cutilSafeCall( cudaMemcpyToSymbolAsync("d_c_reference_batch_seqlen", ref_batch->reference_batch[i][g].seqlen, sizeof(int) * MAX_RefBatchSize, 0, cudaMemcpyHostToDevice, plan[g].stream));		
+			// bind ref to texture memory			
+			cutilSafeCall( cudaMemcpyToArrayAsync(plan[g].d_reference_batch_sequence, 0, 0, ref_batch->reference_batch[i][g].sequence1D_revalued, sizeof(char4) * ref_batch->reference_batch[i][g].size * ref_batch->reference_batch[i][g].seqlen_max_patched_char4, cudaMemcpyHostToDevice, plan[g].stream) );
+			// bind ref to texture memory raw			
+			cutilSafeCall( cudaMemcpyToArrayAsync(plan[g].d_reference_batch_sequence_raw, 0, 0, ref_batch->reference_batch[i][g].sequence1D_revalued_raw, sizeof(char2) * ref_batch->reference_batch[i][g].size * ref_batch->reference_batch[i][g].seqlen_max_patched, cudaMemcpyHostToDevice, plan[g].stream) );			
+			cutilSafeCall( cudaBindTextureToArray(d_tex_reference_batch_sequence, plan[g].d_reference_batch_sequence, char4_channelDesc));	//*/	
+			cutilSafeCall( cudaBindTextureToArray(d_tex_reference_batch_sequence_raw, plan[g].d_reference_batch_sequence_raw, char2_channelDesc));	//*/			
+			d_build_matrix_batch(plan[g].stream, ref_batch->overall_seqlen_max_patched, &(ref_batch->reference_batch[i][g]), query_array, plan[g].d_track, plan[g].d_scores, plan[g].d_good_count, plan[g].d_tempData);					
+		}				
+		// concurrent kernel lunch update score
+		for(int g = 0; g < nGPUs; g++){
+			if(ref_batch->reference_batch[i][g].size == 0) 	continue;
+			cutilSafeCall( cudaSetDevice(g) ); 		
+			//cutilSafeCall(cudaStreamSynchronize(plan[g].stream));
+			// update score on GPU
+			d_updateScores_batch(plan[g].stream, ref_batch->overall_seqlen_max_patched, &(ref_batch->reference_batch[i][g]), query_array, plan[g].d_scores, plan[g].d_good_count);
+			cutilSafeCall( cudaMemcpyAsync(good_count + (shif_offset_level1_good_count[i] + shif_offset_level2_good_count[g]), plan[g].d_good_count, ref_batch_size * query_array->size_patched * sizeof(int), cudaMemcpyDeviceToHost, plan[g].stream));									
+		}
+		// concurrent kernel lunch trace back
+		for(int g = 0; g < nGPUs; g++){
+			if(ref_batch->reference_batch[i][g].size == 0) 	continue;
+			cutilSafeCall( cudaSetDevice(g) ); 	
+			//cutilSafeCall(cudaStreamSynchronize(plan[g].stream));
+			// do trace on GPU							
+			d_traceback_batch(plan[g].stream, ref_batch->overall_seqlen_max_patched, &(ref_batch->reference_batch[i][g]), query_array, plan[g].d_good_count, plan[g].d_track, plan[g].d_scores, plan[g].d_s_hit_struct, plan[g].d_s_hit_struct_alignment);		
+			cutilSafeCall( cudaMemcpyAsync(plan_CPU[g].s_hit_struct, plan[g].d_s_hit_struct, ref_batch_size * MAX_REPORTS_OF_FIRST_HIT * query_array->size_patched * sizeof(S_HIT_struct), cudaMemcpyDeviceToHost, plan[g].stream));
+			cutilSafeCall( cudaMemcpyAsync(plan_CPU[g].s_hit_struct_alignment, plan[g].d_s_hit_struct_alignment, ref_batch_size * MAX_REPORTS_OF_FIRST_HIT* query_array->size_patched * (MAX_QUERY_LENGHT+MAX_QUERY_APPENDIX)* sizeof(char4), cudaMemcpyDeviceToHost, plan[g].stream));						
+		}
+		cutilCheckError( cutCreateTimer( &io_write_timer));	
+		cutilCheckError( cutStartTimer( io_write_timer));	    
+		for(int g = 0; g < nGPUs; g++){
+			if(ref_batch->reference_batch[i][g].size == 0) break;			
+			// calculate scores on CPU			
+			calc_scores_energy_batch(good_count + (shif_offset_level1_good_count[i] + shif_offset_level2_good_count[g]), &(ref_batch->reference_batch[i][g]), query_array, plan_CPU[g].s_hit_struct, plan_CPU[g].s_hit_struct_alignment, fpout, &utr_processed);
+		}
+		cutilCheckError( cutStopTimer( io_write_timer));		
+		*io_write_timer_double += cutGetTimerValue(io_write_timer);
+		cutilCheckError(cutDeleteTimer(io_write_timer));
+		// free memory
+		for(int g = 0; g < nGPUs; g++){
+			if(ref_batch->reference_batch[i][g].size == 0) break;
+			cutilSafeCall( cudaSetDevice(g) ); 				
+			cutilSafeCall(cudaUnbindTexture(d_tex_reference_batch_sequence));
+			cutilSafeCall(cudaUnbindTexture(d_tex_reference_batch_sequence_raw));
+			cutilSafeCall(cudaFreeArray((cudaArray*)plan[g].d_reference_batch_sequence));							
+			cutilSafeCall(cudaFreeArray((cudaArray*)plan[g].d_reference_batch_sequence_raw));
+		}
+	} /// for all batch
+	int total_num_pair = ref_batch->overall_reference_size * query_array->size;
+	*mean_good_count = 0;
+	*GCUP = 0;
+	int count = 0;
+	for(int i = 0; i < ref_batch->batch_length*factor_length; i++){  // for all batch	
+		for(int g = 0; g < nGPUs; g++){
+			if(ref_batch->reference_batch[i][g].size == 0) break;			
+			cudaHostUnregister(ref_batch->reference_batch[i][g].seqlen);
+			cudaHostUnregister(ref_batch->reference_batch[i][g].sequence1D_revalued);
+			cudaHostUnregister(ref_batch->reference_batch[i][g].sequence1D_revalued_raw);				
+			for(int j = 0; j < ref_batch->reference_batch[i][g].size; j++){
+				*GCUP += ref_batch->reference_batch[i][g].seqlen[j] * query_array->total_seqlen;
+				count++;
+			}
+		}
+	}
+	//t_tmp = clock();
+	getMax_good_count(shif_offset_level1_good_count, shif_offset_level2_good_count, max_good_count, mean_good_count, good_count, ref_batch->batch_length, ref_batch_size * query_array->size_patched, total_num_pair);
+	cudaHostUnregister(query_array->sequence1D_reshape);
+	cudaHostUnregister(query_array->sequence1D_reshape_raw);
+	cudaHostUnregister(ali_score);
+	cudaHostUnregister(ali_rep);
+	cudaHostUnregister(ali_score5p);
+	cudaHostUnregister(length_3p_for_weighting_array);
+	cudaHostUnregister(open_ext);
+	cudaHostUnregister(in_seed);
+	cudaHostUnregister(query_array->seqlen);
+
+	// free memory
+	for(int g = 0; g < nGPUs; g++){		
+		cutilSafeCall( cudaSetDevice(g) ); 
+		cutilSafeCall( cudaFree(plan[g].d_s_hit_struct_alignment));
+		cutilSafeCall( cudaFree(plan[g].d_s_hit_struct));		
+		cutilSafeCall( cudaFree(plan[g].d_track)); // global
+		cutilSafeCall( cudaFree(plan[g].d_scores)); // global		
+		cutilSafeCall( cudaFree(plan[g].d_good_count)); // global*/
+		cutilSafeCall( cudaFreeArray((cudaArray*)plan[g].d_query_sequence));	
+		cutilSafeCall( cudaStreamDestroy(plan[g].stream) );
+	}
+	free(plan);
+	for(int g = 0; g < nGPUs; g++){
+		free(plan_CPU[g].s_hit_struct);
+		free(plan_CPU[g].s_hit_struct_alignment);
+	}
+	free(plan_CPU);	
+	/*free(shift_offset_level1);
+	free(shift_offset_level2);
+	free(shift_offset_level3);	*/
+	free(shift_offset_level1_score);
+	free(shift_offset_level2_score);
+	free(open_ext);
+	free(in_seed);
+
+	free(good_count);
+	//*t_cudaMemory += clock() - t_tmp;
+}
+
+
+/* Load Sequences and Set-up the Alignment Run*/
+
+void reportResults(input_type* query_array, Ref_batch* ref_batch, FILE *fpout){
+	int utr_processed = 0;
+	int mirna_processed = 0;
+	/* Read the query sequence(s) (microRNA(s)) from a FASTA file*/				
+	for(int i = 0; i < ref_batch->batch_length; i++){
+		for(int g = 0; g < nGPUs; g++){
+			for(int r = 0; r < ref_batch->reference_batch[i][g].size; r++){	
+				for(int q = 0; q < query_array->size; q++){
+					if (verbosity || debug) {
+						fprintf(fpout, "Read Sequence:%s %s(%d nt)\n", query_array->name[q], query_array->description[q], query_array->seqlen[q]);
+					}//*/
+					if (ref_batch->reference_batch[i][g].restricted_Array[r][q]) continue;
+					/* Keep track of the number of sequences scanned so far*/
+					utr_processed++;
+					if (verbosity || debug) {
+						fprintf(fpout, "Read Sequence:%s %s(%d nt)\n", ref_batch->reference_batch[i][g].name[r],
+							ref_batch->reference_batch[i][g].description[r], ref_batch->reference_batch[i][g].seqlen[r]);
+					}//*/			
+					if(verbosity || debug) {
+						fprintf(fpout, "=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n");
+						fprintf(fpout, "Performing Scan: %s vs %s\n", query_array->name[q], ref_batch->reference_batch[i][g].name[r]);
+						fprintf(fpout, "=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n");
+						//fflush(fpout);
+					}//*/									
+				}// for(q = 0					
+				mirna_processed++;
+			} // for(int r = 0; r < ref_batch->reference_batch[i][g].size; r++){						
+		} // for(g = 0
+	} // for(int i = 0; i < ref_batch->batch_length; i++){
+}
+
+void initilializeCUDA(){		
+	int deviceCount = 0;
+    cudaError_t error_id = cudaGetDeviceCount(&deviceCount);
+    if (error_id != cudaSuccess) {
+        printf("cudaGetDeviceCount returned %d\n-> %s\n", (int)error_id, cudaGetErrorString(error_id) );
+        exit(0);
+    }
+    // This function call returns 0 if there are no CUDA capable devices.
+    if (deviceCount == 0)
+        printf("There is no device supporting CUDA\n");
+    else
+        printf("Found %d CUDA Capable device(s)\n", deviceCount);
+
+    int dev;    
+    for (dev = 0; dev < deviceCount; ++dev) {
+        cudaDeviceProp deviceProp;
+        cudaGetDeviceProperties(&deviceProp, dev);
+		printf("Device %d: \"%s\" with Compute %d.%d capability\n", dev, deviceProp.name, deviceProp.major, deviceProp.minor);
+    }
+	if(deviceCount < nGPUs){
+		printf("There is no enough GPUS (%d) to handle your requests (%d)\n", deviceCount, nGPUs);
+		exit(0);
+	}	
+
+	printf("==============================\n");
+	cudaFuncAttributes 	kernel_attrs; 
+	cudaFuncGetAttributes(&kernel_attrs, d_build_matrix);   
+	print_func_attr(kernel_attrs, "d_build_matrix"); 
+	cudaFuncGetAttributes(&kernel_attrs, d_updateScores);   
+	print_func_attr(kernel_attrs, "d_updateScores"); 
+	cudaFuncGetAttributes(&kernel_attrs, d_traceback);   
+	print_func_attr(kernel_attrs, "d_traceback"); 	
+	cudaFuncSetCacheConfig(d_traceback, cudaFuncCachePreferL1);
+	printf("Num of GPUs used: %d\n", nGPUs);
+	printf("Software written on GPU by: Shuang Wang on 2012 Feb. \n Distributed for anyone to use under the GNU Public License (GPL)\n");
+
+}
+
+int find_targets(FILE* query_fp, FILE* fpout, pair_struct* pairs, int total_pairs, char* filename) {		
+	unsigned int all_timer = 0, io_read_timer = 0, align_timer = 0;	
+	float io_write_timer = 0;
+	cutilCheckError( cutCreateTimer( &all_timer));
+	cutilCheckError( cutCreateTimer( &io_read_timer));	
+	cutilCheckError( cutCreateTimer( &align_timer));
+	// load query and reference.		
+	//Get GPU information
+	initilializeCUDA();	
+	cutilCheckError( cutStartTimer( io_read_timer));	    
+	cutilCheckError( cutStartTimer( all_timer));	
+	input_type* query_array = loadQuery(query_fp); // array for storing all queries;		
+	Ref_batch* ref_batch = getRef_batch(filename, query_array, pairs, total_pairs); // load reference in sorted batch;	
+	cutilCheckError( cutStopTimer( io_read_timer));    
+	
+	int max_good_count = 0;
+	double mean_good_count= 0;
+	double GCUP = 0;
+	
+    cutilCheckError( cutStartTimer( align_timer));	    
+	do_alignment(query_array, ref_batch, 1, fpout, length_3p_for_weighting_array, &io_write_timer, &max_good_count, &mean_good_count, &GCUP); 
+	cutilCheckError( cutStopTimer( align_timer));	
+
+	// output results		
+	reportResults(query_array, ref_batch, fpout);	
+	fprintf(fpout, "Scan Complete\n\n");	
+	printf( "IO read cost on CPU : %f (ms)\n", cutGetTimerValue(io_read_timer));			
+	//printf( "Build_matrix on GPU: %d (ms)\n", t_cudaBuildMatrix);	
+	//printf( "CUDA MEMORY: %d (ms)\n", t_cudaMemory);
+	//printf( "Update Score on CPU: %d (ms)\n", t_update_Score);
+	//printf( "calculate energy on CPU: %d (ms)\n", t_calcEnergy);
+	printf( "IO write on CPU : %f (ms)\n", io_write_timer);	
+	printf("max good count: %d; mean good count: %f\n", max_good_count, mean_good_count);
+	printf("GCUP: %f; GCUPs: %f\n", GCUP*1E-9, GCUP*1E-6/(cutGetTimerValue(align_timer)- io_write_timer));
+	printf("num of ref: %d; max length: %d; min length: %d; ave length: %f; num of batchs: %d\n", ref_batch->overall_reference_size, ref_batch->overall_seqlen_max,ref_batch->overall_seqlen_min, ref_batch->overall_mean, ref_batch->batch_length);
+	printf("num of query: %d; max length: %d; min length: %d; ave length: %f\n", query_array->size, query_array->seqlen_max, query_array->seqlen_min, query_array->seqlen_mean);
+	printf( "Alignment time: %f (ms)\n", (cutGetTimerValue(align_timer)-io_write_timer));	
+	
+	fflush(fpout);	
+	freeRef_batch(ref_batch, query_array->size);
+	freeInputType(query_array);		
+	cutilCheckError( cutStopTimer( all_timer));
+	printf( "Processing time: %f (ms)\n", cutGetTimerValue(all_timer));	
+	return 1;
+}
